@@ -1,0 +1,185 @@
+function Invoke-ScriptSqlDatabase {
+    <#
+
+.SYNOPSIS
+    Scripts a SQL Server database.
+
+.DESCRIPTION
+    This function will connect to a SQL Server instance and script a particular database(s).
+
+.EXAMPLE
+    Invoke-ScriptSqlDatabase -SqlInstance SQLTEST -Database Adventureworks2017 -SqlAuthentication $true -Directory "C:\output"
+
+.EXAMPLE
+    Invoke-ScriptSqlDatabase -SqlInstance SQLTEST -Database "Adventureworks2017","AdventureworksDW2017" -SqlAuthentication $false -Directory "C:\output"
+
+.LINK
+    For a full list of ScriptingOptions used by this script, please see http://bit.ly/2M8GfGy.
+
+.NOTES
+        MIT License
+		
+		Copyright (c) 2018 sqlservermigrations.com
+	
+		Permission is hereby granted, free of charge, to any person obtaining a copy
+		of this software and associated documentation files (the "Software"), to deal
+		in the Software without restriction, including without limitation the rights
+		to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+		copies of the Software, and to permit persons to whom the Software is
+		furnished to do so, subject to the following conditions:
+	
+		The above copyright notice and this permission notice shall be included in all
+		copies or substantial portions of the Software.
+	
+		THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+		IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+		FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+		AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+		LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+		OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+		SOFTWARE.
+#>
+    [CmdletBinding()]
+    param(
+        #SqlInstance - Source SQL Server instance.
+        [Parameter(Mandatory = $true)]
+        [string]$SqlInstance,
+        #Database, or array of databases, to script.
+        [Parameter(Mandatory = $true)]
+        [array]$Database,
+        #SqlAuthentication - Boolean.  Default is false (use Windows Authentication)
+        [Parameter(Mandatory = $false)]
+        [boolean]$SqlAuthentication,
+        #Directory - This is where the script will reside.
+        [Parameter(Mandatory = $true)]
+        [string]$Directory,
+        #ContinueScriptingOnError - If an error is encountered while generating the script, continue if $true. 
+        [Parameter(Mandatory = $false)]
+        [boolean]$ContinueScriptingOnError
+    )
+
+    BEGIN {
+        #import the SQLServer module
+        if (-not(get-module -name SqlServer)) {
+            if (Get-Module -ListAvailable | Where-Object { $_.Name -eq "SqlServer" }) {
+                import-module "SqlServer"
+	               
+            }
+            else {
+                throw "This function requires the SqlServer module.  Get it here http://bit.ly/2MmOZpk"
+            }
+        }
+
+        #append a timestamp to the generated script files
+        $DateTimestamp = $(get-date -f "yyyyMMdd-HHmmss")
+
+        #create the output directory if not exists
+        if (-not( Test-Path "$Directory\" -PathType Container)) {
+            New-Item -ItemType Directory -Path $Directory
+        }
+
+        #setup connection to the Sql instance.
+        $SqlSMO = New-Object -TypeName Microsoft.SqlServer.Management.Smo.Server -ArgumentList $SqlInstance
+
+        #if SqlAuthentication is true, grab user credentials
+        if ($SqlAuthentication) {
+            $cred = Get-Credential
+            $SqlSMO.ConnectionContext.LoginSecure = $false
+            $SqlSMO.ConnectionContext.set_Login($cred.UserName)
+            $SqlSMO.ConnectionContext.set_SecurePassword($cred.Password)
+                
+        }
+        else {
+            $SqlSMO.ConnectionContext.LoginSecure = $true
+                
+        }
+        
+        #try connecting
+        try { $SqlSMO.ConnectionContext.Connect() } 
+        catch {
+            throw "Can't connect to $SqlInstance."
+
+        }
+
+
+    }
+
+    PROCESS {
+        #trap errors
+        Trap {
+            # Handle the error
+            $err = $_.Exception
+            write-warning $err.Message
+            while ( $err.InnerException ) {
+                $err = $err.InnerException
+                write-warning $err.Message
+            };
+            # Stop the script.
+            break
+        }
+        
+        
+        #loop over the array of databases and generate scripts
+        $Database | ForEach-Object {
+            
+            #Check OS.  If Linux or Windows.  Update directory.
+            if($env:OS) {
+            $Filename = "$($Directory)\$($_)_$($DateTimestamp).sql"
+            }
+            else {
+            $Filename = "$($Directory)/$($_)_$($DateTimeStamp).sql"
+            }
+
+            $db = $SqlSMO.Databases[$_] 
+            
+            if (-not($db)) {
+                throw "The $_ database was not found on $SqlInstance."
+            }
+
+            #Create database script options
+            $databaseSCRP = New-Object Microsoft.SqlServer.Management.Smo.Scripter($SqlSmo)
+            $databaseSCRP.Options.ScriptBatchTerminator = $true
+            $databaseSCRP.Options.IncludeHeaders = $true
+            $databaseSCRP.Options.ExtendedProperties = $true
+            $databaseSCRP.Options.ToFileOnly = $true
+            $databaseSCRP.Options.Filename = $Filename
+            $databaseSCRP.Options.Encoding = [System.Text.Encoding]::UTF8
+            $databaseSCRP.Script($db)
+
+           #Script database objects
+            $transfer = New-Object -TypeName Microsoft.SqlServer.Management.Smo.Transfer -ArgumentList $db
+            $ScriptOptions = New-Object -TypeName Microsoft.SqlServer.Management.Smo.ScriptingOptions
+
+            #setup options
+            $ScriptOptions.ExtendedProperties = $true
+            $ScriptOptions.DriAll = $true
+            $ScriptOptions.Indexes = $true
+            $ScriptOptions.Triggers = $true
+            $ScriptOptions.ScriptBatchTerminator = $true
+            $ScriptOptions.IncludeHeaders = $true
+            $ScriptOptions.Permissions = $true
+            $ScriptOptions.Statistics = $true
+            $ScriptOptions.ToFileOnly = $true
+            $ScriptOptions.IncludeIfNotExists = $true
+            $ScriptOptions.FileName = $FileName
+            $ScriptOptions.AppendToFile = $true
+            $ScriptOptions.Encoding = [System.Text.Encoding]::UTF8
+
+           #Continue scripting if an error is encountered?  Errors can be seen if objects have dependencies on other objects that are no longer in place.
+           if ($ContinueScriptingOnError) {
+                   $ScriptOptions.ContinueScriptingOnError = $true
+                }
+
+            $transfer.Options = $ScriptOptions
+            $transfer.ScriptTransfer()
+        }
+
+    }
+        
+    END {
+
+        write-host "Script complete.  All scripts are located in the $Directory folder."  -ForegroundColor Green
+    }
+  
+
+}
